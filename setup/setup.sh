@@ -14,6 +14,15 @@ if [[ $ADMIN_EMAIL == "" ]]; then
     exit
 fi
 
+sudo apt install curl ca-certificates
+
+# Required for postgresql
+sudo install -d /usr/share/postgresql-common/pgdg
+sudo curl -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc --fail https://www.postgresql.org/media/keys/ACCC4CF8.asc
+
+# Create the repository configuration file:
+sudo sh -c 'echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list'
+
 sudo apt update
 sudo apt -y upgrade
 sudo apt -y autoremove
@@ -25,7 +34,7 @@ wget -O keycloak.tar.gz https://github.com/keycloak/keycloak/releases/download/1
 tar -xvf keycloak.tar.gz -C ../..
 
 # Install postgresql and setup db
-sudo apt install -y postgresql-12 postgresql-client-12
+sudo apt install -y postgresql-16 postgresql-client-16
 sudo -H -u postgres bash -c "psql -f db-setup.sql"
 
 # Install nodejs
