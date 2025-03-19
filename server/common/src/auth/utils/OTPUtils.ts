@@ -38,8 +38,8 @@ export function setOTPConfig(config: PhoneOTPConfig) {
  * @param length Length of the OTP
  */
 export function generateOTP(length: number = 6) {
-  // const otp = Math.round((Math.random() * 0.9 + 0.1) * Math.pow(10, length));
-  const otp = '112233';
+  const otp = Math.round((Math.random() * 0.9 + 0.1) * Math.pow(10, length));
+  //const otp = '112233';
 
   return otp;
 }
@@ -50,24 +50,41 @@ export function generateOTP(length: number = 6) {
  * @param otp OTP to be sent
  */
 export async function sendOTP(phone_number: string, otp: string) {
-  // Extract information from environment
-  return 'ok'
-  const templateUrl = envGetString('PHONE_OTP_URL');
-  const apiKey = envGetString('PHONE_OTP_API_KEY');
+  try {
+    const baseUrl = envGetString('PHONE_OTP_BASE_URL');  
+    const apiKey = envGetString('PHONE_OTP_API_KEY');  
+    const template = envGetString('PHONE_OTP_TEMPLATE');  
 
-  // Generate the url for otp request
-  const url = templateUrl
-    .replace('__API_KEY__', apiKey)
-    .replace('__PHONE_NUMBER__', phone_number)
-    .replace('__OTP__', otp)
-    .replace('__TEMPLATE__', 'OTP_ENGLISH');
+    if (!baseUrl || !apiKey) {
+      throw new Error(" Missing PHONE_OTP_BASE_URL or PHONE_OTP_API_KEY");
+    }
 
-  // Send the request for OTP
-  const response = await axios.get(url);
-  if (response.data.Status != 'Success') {
-    throw new Error('Unable to send OTP');
+    //  Ensure baseUrl ends with a `/`
+    const formattedBaseUrl = baseUrl.endsWith("/") ? baseUrl : baseUrl + "/";
+
+    //  Dynamically insert phone number & OTP into the URL
+    const url = `${formattedBaseUrl}${apiKey}/SMS/${phone_number}/${otp}/${template}`;
+
+    console.log(` Corrected Request URL: ${url}`);
+
+    // Send the request
+    const response = await axios.get(url);
+    console.log(" API Response:", response.data);
+
+    if (response.data.Status !== 'Success') {
+      console.error(" OTP Sending Failed:", response.data);
+      throw new Error(`Failed to send OTP: ${response.data.Details}`);
+    }
+
+    console.log(` OTP ${otp} sent to ${phone_number}`);
+  } catch (error) {
+    //@ts-ignore
+    console.error(' Error in sendOTP():', error?.response?.data || error.message);
+    throw new Error('OTP service unavailable. Try again later.');
   }
 }
+
+
 
 // Expected state for OTP routes
 export type OTPState<EntityType extends 'server_user' | 'worker'> = {
@@ -122,27 +139,51 @@ export function OTPHandlerTemplate<EntityType extends 'server_user' | 'worker'>(
    * @param ctx Karya request context
    */
   const generate: OTPMiddleware = async (ctx, next) => {
-    const entity = ctx.state.entity;
-    const phone_number = ctx.state.phone_number;
-    // Generate OTP for the worker
-    const otp = generateOTP();
-
-    // Update worker record with otp
-    // @ts-ignore Unclear why this error is occuring.
-    await BasicModel.updateSingle(entityType, { id: entity.id }, { phone_number, otp });
-
-    // TODO: Need to update generation time and handle rate limits
-
-    // Send the otp
     try {
-      await sendOTP(phone_number, otp);
-      HttpResponse.OK(ctx, {});
+      const phone_number = ctx.state.phone_number;
+  
+      // Generate OTP
+      const otp = generateOTP();
+      console.log(` Generated OTP: ${otp} for phone ${phone_number}`);
+  
+      // Fetch worker record first
+      //@ts-ignore
+      const worker = await BasicModel.getSingle(entityType, { phone_number });
+  
+      if (!worker) {
+        console.error(`No worker found for phone number: ${phone_number}`);
+        HttpResponse.BadRequest(ctx, 'Phone number not registered');
+        return;
+      }
+  
+      console.log(`Updating OTP for worker ID: ${worker.id}`);
+  
+      // Update worker record and store `otp_generated_at` as a JSON object
+      //@ts-ignore
+      const updateResult = await BasicModel.updateSingle(
+        entityType,//@ts-ignore 
+        { id: worker.id }, 
+        { 
+          otp, 
+          otp_generated_at: JSON.stringify({ timestamp: new Date().toISOString() }) // ✅ Convert to JSON object
+        }
+      );
+  
+      console.log("OTP update result:", updateResult);
+  
+      //  Send OTP via 2Factor API
+      await sendOTP(phone_number, otp.toString());
+  
+      HttpResponse.OK(ctx, { success: true });
       await next();
-    } catch (e) {
+    } catch (error) {
+      console.error(" Error in generate function:", error);
       HttpResponse.Unavailable(ctx, 'Could not send OTP');
     }
   };
-
+  
+  
+  
   /**
    * Resend a previously generated OTP for the worker.
    * @param ctx Karya request context
@@ -173,30 +214,57 @@ export function OTPHandlerTemplate<EntityType extends 'server_user' | 'worker'>(
    * @param ctx Karya request context
    */
   const verify: OTPMiddleware = async (ctx, next): Promise<boolean> => {
-    const entity = ctx.state.entity;
-
-    // Extract OTP from the header
-    const otp = ctx.request.header['otp'];
-
-    // Check if otp is valid
-    if (!otp || otp instanceof Array) {
-      HttpResponse.BadRequest(ctx, 'Missing or multiple OTPs');
+    try {
+      const phone_number = ctx.request.header['phone-number'];
+      const otp = ctx.request.header['otp'];
+  
+      console.log(` Verifying OTP for ${phone_number}`);
+  
+      // Check if OTP and phone number are provided
+      if (!otp || otp instanceof Array || !phone_number) {
+        console.error(" Missing OTP or phone number");
+        HttpResponse.BadRequest(ctx, 'Missing OTP or phone number');
+        return false;
+      }
+  
+      // Fetch stored OTP from database
+      //@ts-ignore
+      const worker = await BasicModel.getSingle(entityType, { phone_number });
+  
+      if (!worker) {
+        console.error(` Phone number not found: ${phone_number}`);
+        HttpResponse.BadRequest(ctx, 'Phone number not found');
+        return false;
+      }
+  
+      console.log(`Stored OTP in DB: '${worker.otp}', Received OTP: '${otp}'`);
+  
+      // Ensure OTP is a string before comparison
+      const storedOtp = worker.otp ? String(worker.otp).trim() : "";
+      const receivedOtp = String(otp).trim();
+  
+      // Check if OTP is valid
+      if (storedOtp !== receivedOtp) {
+        console.error(" Invalid OTP entered!");
+        HttpResponse.Unauthorized(ctx, 'Invalid OTP');
+        return false;
+      }
+  
+      console.log(`OTP verified successfully for ${phone_number}`);
+  
+      //  Send ONLY `{ success: true }`
+      HttpResponse.OK(ctx, { message: "Verified" });
+  
+      return true;
+    } catch (error) {
+      console.error(" Error verifying OTP:", error);
+      HttpResponse.InternalError(ctx, 'Failed to verify OTP');
       return false;
     }
-
-    // If OTP is not valid, then unauthorized access
-    if (otp != entity.otp) {
-      HttpResponse.Unauthorized(ctx, 'Invalid OTP');
-      return false;
-    }
-
-    // Clear OTP field
-    // @ts-ignore: Unclear why this error is occuring.
-    await BasicModel.updateSingle(entityType, { id: entity.id }, { otp: null });
-    HttpResponse.OK(ctx, {});
-    await next();
-    return true;
   };
+  
+  
+  
 
   return { generate, resend, verify, checkPhoneNumber };
 }
